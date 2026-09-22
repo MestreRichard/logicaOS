@@ -39,10 +39,37 @@ if (typeof engine.recall === 'function') {
       return await _originalRecall(...args);
     } catch (err) {
       // Só loga 1x por tipo de erro para diagnóstico — não flood
-      const errKey = String(err?.message ?? err).slice(0, 60);
-      if (!engine.recall._seenErrors) engine.recall._seenErrors = new Set();
+      // [QA Auto-Heal 2026-09-17 — Fix #6: normalizar errKey para dedup robusto]
+      // Problema: mensagens 503 variam após char 60 (reason: delayed connect error: 111 vs
+      // reason: remote connection failure) → _seenErrors trata como erros distintos → 36 logs/4h.
+      // Fix: remover variações numéricas e trailing reason antes de fatiar.
+      // [QA Auto-Heal 2026-09-22 — Fix #7: persistir _seenErrors entre restarts PM2]
+      // Problema: _seenErrors era Set() in-memory — resetado a cada restart → dedup ineficaz.
+      // 5+ restarts detectados nas últimas 4h → 36 logs/4h escapavam pós-restart.
+      // Fix: carregar/salvar em /tmp/memory-seen-errors.json com TTL 4h.
+      // Issue: https://github.com/MestreRichard/logicaOS/issues/217
+      const _fs = require('fs');
+      const _SEEN_FILE = '/tmp/memory-seen-errors.json';
+      const _SEEN_TTL  = 4 * 3600 * 1000;
+      function _loadSeenErrors() {
+        try {
+          const raw = JSON.parse(_fs.readFileSync(_SEEN_FILE, 'utf8'));
+          if (Date.now() - (raw.savedAt || 0) < _SEEN_TTL) return new Set(raw.errors || []);
+        } catch (_) {}
+        return new Set();
+      }
+      function _saveSeenErrors(set) {
+        try { _fs.writeFileSync(_SEEN_FILE, JSON.stringify({ savedAt: Date.now(), errors: [...set] })); } catch (_) {}
+      }
+      const errKey = String(err?.message ?? err)
+        .replace(/\d{3,}/g, 'N')     // números longos → N (ex: 503, 10000, porta)
+        .replace(/reason: .+/, '')    // remove trailing reason (varia por retry path)
+        .trim()
+        .slice(0, 80);
+      if (!engine.recall._seenErrors) engine.recall._seenErrors = _loadSeenErrors();
       if (!engine.recall._seenErrors.has(errKey)) {
         engine.recall._seenErrors.add(errKey);
+        _saveSeenErrors(engine.recall._seenErrors);
         console.warn(`[memory-engine] recall suprimido (1x por tipo): ${errKey}`);
       }
       return [];
