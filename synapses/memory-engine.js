@@ -35,38 +35,58 @@ if (typeof engine.recall === 'function') {
     // [QA 2026-08-01] try/catch defensivo: se .jsc usa supabase direto (sem proxy),
     // captura o fetch failed silenciosamente e retorna array vazio.
     // Não prejudica funcionalidade — recall degraded gracefully é preferível a stderr flood.
-    try {
-      return await _originalRecall(...args);
-    } catch (err) {
-      // Só loga 1x por tipo de erro para diagnóstico — não flood
-      // [QA Auto-Heal 2026-09-17 — Fix #6: normalizar errKey para dedup robusto]
-      // Problema: mensagens 503 variam após char 60 (reason: delayed connect error: 111 vs
-      // reason: remote connection failure) → _seenErrors trata como erros distintos → 36 logs/4h.
-      // Fix: remover variações numéricas e trailing reason antes de fatiar.
-      // [QA Auto-Heal 2026-09-22 — Fix #7: persistir _seenErrors entre restarts PM2]
-      // Problema: _seenErrors era Set() in-memory — resetado a cada restart → dedup ineficaz.
-      // 5+ restarts detectados nas últimas 4h → 36 logs/4h escapavam pós-restart.
-      // Fix: carregar/salvar em /tmp/memory-seen-errors.json com TTL 4h.
-      // Issue: https://github.com/MestreRichard/logicaOS/issues/217
-      const _fs = require('fs');
-      const _SEEN_FILE = '/tmp/memory-seen-errors.json';
-      const _SEEN_TTL  = 4 * 3600 * 1000;
-      function _loadSeenErrors() {
-        try {
-          const raw = JSON.parse(_fs.readFileSync(_SEEN_FILE, 'utf8'));
-          if (Date.now() - (raw.savedAt || 0) < _SEEN_TTL) return new Set(raw.errors || []);
-        } catch (_) {}
-        return new Set();
-      }
-      function _saveSeenErrors(set) {
-        try { _fs.writeFileSync(_SEEN_FILE, JSON.stringify({ savedAt: Date.now(), errors: [...set] })); } catch (_) {}
-      }
-      const errKey = String(err?.message ?? err)
-        .replace(/\d{3,}/g, 'N')     // números longos → N (ex: 503, 10000, porta)
-        .replace(/reason: .+/, '')    // remove trailing reason (varia por retry path)
+    //
+    // [QA Auto-Heal 2026-09-23 — Fix #8: monkey-patch console.warn para suprimir recall falhou do .jsc]
+    // Problema: os 61 logs "recall falhou" em 4h vêm do bytecode (.jsc) via console.warn ANTES do throw.
+    // O wrapper JS captura o throw e faz dedup via _seenErrors (Fix #7), mas o warn já saiu do .jsc.
+    // Fix: interceptar console.warn durante _originalRecall e filtrar linhas de "recall falhou"
+    // cujo errKey já foi visto — suprime o warn repetido do .jsc de forma transparente.
+    // Issue: https://github.com/MestreRichard/logicaOS/issues/227
+    const _fs = require('fs');
+    const _SEEN_FILE = '/tmp/memory-seen-errors.json';
+    const _SEEN_TTL  = 4 * 3600 * 1000;
+    function _loadSeenErrors() {
+      try {
+        const raw = JSON.parse(_fs.readFileSync(_SEEN_FILE, 'utf8'));
+        if (Date.now() - (raw.savedAt || 0) < _SEEN_TTL) return new Set(raw.errors || []);
+      } catch (_) {}
+      return new Set();
+    }
+    function _saveSeenErrors(set) {
+      try { _fs.writeFileSync(_SEEN_FILE, JSON.stringify({ savedAt: Date.now(), errors: [...set] })); } catch (_) {}
+    }
+    function _normalizeErrKey(msg) {
+      return String(msg)
+        .replace(/\d{3,}/g, 'N')
+        .replace(/reason: .+/, '')
         .trim()
         .slice(0, 80);
-      if (!engine.recall._seenErrors) engine.recall._seenErrors = _loadSeenErrors();
+    }
+    // Inicializa _seenErrors UMA vez (persistido entre restarts via /tmp)
+    if (!engine.recall._seenErrors) engine.recall._seenErrors = _loadSeenErrors();
+
+    // [Fix #8] Monkey-patch console.warn para suprimir warn do .jsc quando errKey já visto
+    const _origWarn = console.warn;
+    console.warn = function (...warnArgs) {
+      const msg = warnArgs.join(' ');
+      if (/\[memory-engine\].*recall falhou/.test(msg)) {
+        const k = _normalizeErrKey(msg.replace(/.*err=/, ''));
+        if (engine.recall._seenErrors.has(k)) return; // suprimido — já logado 1x
+      }
+      _origWarn.apply(console, warnArgs);
+    };
+
+    try {
+      const result = await _originalRecall(...args);
+      console.warn = _origWarn; // restaura após chamada bem-sucedida
+      return result;
+    } catch (err) {
+      console.warn = _origWarn; // restaura sempre, mesmo em erro
+      // Só loga 1x por tipo de erro para diagnóstico — não flood
+      // [QA Auto-Heal 2026-09-17 — Fix #6: normalizar errKey para dedup robusto]
+      // [QA Auto-Heal 2026-09-22 — Fix #7: persistir _seenErrors entre restarts PM2]
+      // Issue: https://github.com/MestreRichard/logicaOS/issues/217
+      const errKey = _normalizeErrKey(err?.message ?? err);
       if (!engine.recall._seenErrors.has(errKey)) {
         engine.recall._seenErrors.add(errKey);
         _saveSeenErrors(engine.recall._seenErrors);
