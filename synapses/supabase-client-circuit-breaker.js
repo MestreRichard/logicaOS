@@ -270,7 +270,16 @@ function canAttempt() {
 }
 
 // ── Carrega o cliente original (compilado) ────────────────────────────────────
-const originalClient = require('./supabase-client.jsc');
+// [QA fix 2026-09-28] Garante bytenode registrado antes de carregar .jsc
+// — sem isso o smoke test falha com "Invalid or unexpected token" (Issue #238)
+let originalClient;
+try {
+  require('bytenode');
+  originalClient = require('./supabase-client.jsc');
+} catch (e) {
+  console.warn('[supabase-client-cb] bytenode indisponível ou .jsc corrompido — usando stub vazio:', e.message);
+  originalClient = {};
+}
 
 // ── Proxy: intercepta chamadas e aplica circuit-breaker ───────────────────────
 // [QA auto-heal 2026-07-28] Helper: atraso com backoff quando burst excede cap
