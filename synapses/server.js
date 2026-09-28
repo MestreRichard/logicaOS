@@ -52,18 +52,42 @@ console.error = (...args) => _dedupLog(_originalError, args);
 console.warn  = (...args) => _dedupLog(_originalWarn,  args);
 // ── fim dedup ─────────────────────────────────────────────────────────────────
 
-// ── QA Auto-Heal Fix #10 — 2026-09-25: auto-migrate no startup [#232] ─────────
-// Problema: migrate.js nunca executava automaticamente → schema v1.7 ficava incompleto
-// a cada restart, disparando [schema-check] 20x/4h e deixando token_budget_daily,
-// team_logs e coordination_events INATIVOS.
-// Fix: executar migrate.jsc no boot, ANTES de carregar server.jsc.
+// ── QA Auto-Heal Fix #11 — 2026-09-27: auto-migrate assíncrono pós-reconexão [auto-002] ──
+// Problema (Fix #10, 2026-09-25): migrate.jsc era chamado sincronamente no boot,
+// mas nos 6 restarts registrados o Supabase estava offline → falha silenciosa no try/catch
+// → schema v1.7 nunca aplicado → [schema-check] continuava emitindo 26 warnings/4h.
+// Root cause: race condition — migrate executa antes do circuit-breaker confirmar conectividade.
+//
+// Fix #11: estratégia dual:
+//   1. Se circuit já CLOSED no boot (Supabase disponível) → migrate imediato via setImmediate
+//   2. Se circuit OPEN/HALF_OPEN → aguarda evento 'supabase:circuit:closed' (emitido pelo CB)
 // Guard: AUTO_MIGRATE=false desabilita (útil em ambientes onde migration é manual).
+// Detectado por: QA Auto-Heal 2026-09-27 | agent_events auto-002
 if (process.env.AUTO_MIGRATE !== 'false') {
+  function _runMigrate(via) {
+    try {
+      require('./migrate');
+      _originalWarn('[startup] auto-migrate executado (' + via + ')');
+    } catch (e) {
+      // Não fatal — server sobe mesmo se migrate falhar
+      _originalWarn('[startup] auto-migrate falhou (non-fatal) via ' + via + ':', e.message);
+    }
+  }
+
+  // Verificar estado atual do circuit-breaker (pode estar CLOSED desde o boot)
   try {
-    require('./migrate');
-  } catch (e) {
-    // Não fatal — server sobe mesmo se migrate falhar (infra pode estar indisponível)
-    console.warn('[startup] auto-migrate falhou (non-fatal):', e.message);
+    const _cb = require('./supabase-client-circuit-breaker');
+    const _state = _cb.__circuitState?.();
+    if (_state && _state.state === 'CLOSED') {
+      // Supabase disponível agora — executar imediatamente após carregar server.jsc
+      setImmediate(() => _runMigrate('boot-imediato'));
+    } else {
+      // OPEN ou HALF_OPEN — aguardar reconexão proativa (circuit-breaker emite este evento)
+      process.once('supabase:circuit:closed', () => _runMigrate('pos-reconexao'));
+    }
+  } catch (_) {
+    // circuit-breaker não disponível — fallback para comportamento anterior (melhor que nada)
+    setImmediate(() => _runMigrate('fallback'));
   }
 }
 // ── fim auto-migrate ──────────────────────────────────────────────────────────
