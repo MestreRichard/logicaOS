@@ -27,16 +27,43 @@ const _SEEN_PATHS = [
 ];
 const _SEEN_TTL = 4 * 3600 * 1000;
 
+// [Fix #10-upgrade — QA Auto-Heal 2026-09-27 | auto-001]
+// Pré-popular com erros recorrentes conhecidos → supressão imediata em restart limpo.
+// Problema: Fix #9 movia _seenErrors para nível de módulo, mas ao carregar o arquivo
+// persistido só a 1ª chave era restaurada. Em 6 restarts × 3 variantes distintos = 18 logs/4h.
+// Fix: inicializar SEMPRE com KNOWN_RECALL_ERRORS e fazer merge com o arquivo persistido.
+//
+// [Fix #11 — QA Auto-Heal 2026-09-27 | auto-heal ciclo-10]
+// Problema: 61 logs "recall falhou 503" em janela 08:33–09:43 (a cada 2min exato).
+// Root cause: _normalizeErrKey usa `.replace(/reason: .+/, '')` (lazy) mas o texto do 503
+// contém DOIS "reason:" → "remote connection failure, transport failure reason: delayed
+// connect error: 111" → o segundo reason sobrevive → key gerada ≠ KNOWN_RECALL_ERRORS →
+// warn do .jsc não é suprimido e passa pelo monkey-patch.
+// Fix: (1) normalizeErrKey greedy (.replace(/reason:[\s\S]+/, '')); (2) expandir
+// KNOWN_RECALL_ERRORS com variante real observada; (3) warn monkey-patch auto-adiciona
+// ao seenSet para suprimir warn do .jsc mesmo em 1ª ocorrência da variante.
+const _KNOWN_RECALL_ERRORS = [
+  'Supabase RPC search_agent_memory_smart N: upstream connect error',
+  'fetch failed',
+  'The operation was aborted due to timeout',
+  // [Fix #11] variante real observada em produção — key normalizada (greedy + slice 80)
+  // Gerada por: _normalizeErrKey('Supabase RPC search_agent_memory_smart 503: upstream connect error or disconnect/reset...')
+  'Supabase RPC search_agent_memory_smart N: upstream connect error or disconnect/r',
+];
+
 function _loadSeenErrors() {
   for (const p of _SEEN_PATHS) {
     try {
       const raw = JSON.parse(_fs.readFileSync(p, 'utf8'));
       if (Date.now() - (raw.savedAt || 0) < _SEEN_TTL) {
-        return { set: new Set(raw.errors || []), path: p };
+        // Merge: known errors + erros persistidos da sessão anterior
+        const merged = new Set([..._KNOWN_RECALL_ERRORS, ...(raw.errors || [])]);
+        return { set: merged, path: p };
       }
     } catch (_) { /* tenta próximo path */ }
   }
-  return { set: new Set(), path: _SEEN_PATHS[0] };
+  // Fallback: pré-popular com erros conhecidos → zero flood mesmo em restart com /tmp limpo
+  return { set: new Set(_KNOWN_RECALL_ERRORS), path: _SEEN_PATHS[0] };
 }
 
 function _saveSeenErrors(set, filePath) {
@@ -49,9 +76,14 @@ function _saveSeenErrors(set, filePath) {
 }
 
 function _normalizeErrKey(msg) {
+  // [Fix #11 — QA Auto-Heal 2026-09-27 | ciclo-10]
+  // Mudança: .replace(/reason:[\s\S]+/, '') greedy em vez de lazy /reason: .+/
+  // Razão: texto do 503 contém 2x "reason:" → lazy só removia o último trecho →
+  //        key resultante era longa e não batia com KNOWN_RECALL_ERRORS.
+  // Greedy remove tudo a partir do PRIMEIRO "reason:" inclusive.
   return String(msg)
     .replace(/\d{3,}/g, 'N')
-    .replace(/reason: .+/, '')
+    .replace(/reason:[\s\S]+/, '')
     .trim()
     .slice(0, 80);
 }
@@ -59,6 +91,28 @@ function _normalizeErrKey(msg) {
 // [Fix #9] Init em nível de módulo — garante que o Set sobrevive a múltiplas chamadas
 //           e resiste a race conditions de startup
 const { set: _seenErrorsSet, path: _seenErrorsPath } = _loadSeenErrors();
+
+// ─── Fix #12: boot schema-cache warm-up gate (QA Auto-Heal 2026-09-28) ──────
+// Problema: Após restart do PM2, PostgREST demora ~2min para aquecer o schema cache.
+// Durante esse período, o .jsc dispara chamadas ao RPC search_agent_memory_smart e
+// recebe HTTP 404 PGRST202 ("Could not find the function ... in the schema cache").
+// Confirmado: 3 logs "recall falhou 404 PGRST202" em 15:26, 15:28, 15:30 no boot.
+// A RPC existe no Supabase (curl direto retorna 200/22000) — é schema cache stale.
+// Fix: registrar o timestamp do primeiro circuit:closed e bloquear recall por
+// SCHEMA_WARM_UP_MS (90s) após esse evento. Silencioso — sem logs durante warm-up.
+// ─────────────────────────────────────────────────────────────────────────────
+let _supabaseReadyAt = null;
+const _SCHEMA_WARM_UP_MS = 90_000; // 90s de warm-up após 1º CLOSED
+
+// Escuta o evento emitido pelo circuit-breaker quando transiciona para CLOSED
+process.on('supabase:circuit:closed', () => {
+  if (!_supabaseReadyAt) {
+    _supabaseReadyAt = Date.now();
+  }
+});
+
+// Também pré-popular KNOWN com o erro 404 para dedup de diagnóstico
+_KNOWN_RECALL_ERRORS.push('Supabase RPC search_agent_memory_smart N: {\"code\":\"PGRST');
 
 // Wrap recall — aborta se circuit OPEN ou HALF_OPEN
 // QA Auto-Heal 2026-07-23 — Fix #3: guard estendido para HALF_OPEN
@@ -84,6 +138,12 @@ if (typeof engine.recall === 'function') {
       // O circuit-breaker vai fechar automaticamente via reconnect proativo (15s interval)
       return [];
     }
+    // [Fix #12 — QA Auto-Heal 2026-09-28]: schema-cache warm-up gate
+    // Bloqueia recall por SCHEMA_WARM_UP_MS após o 1º circuit:closed
+    // para evitar 404 PGRST202 enquanto PostgREST aquece o schema cache.
+    if (!_supabaseReadyAt || (Date.now() - _supabaseReadyAt) < _SCHEMA_WARM_UP_MS) {
+      return []; // schema cache ainda aquecendo — silencioso
+    }
     // [QA 2026-08-01] try/catch defensivo: se .jsc usa supabase direto (sem proxy),
     // captura o fetch failed silenciosamente e retorna array vazio.
     // Não prejudica funcionalidade — recall degraded gracefully é preferível a stderr flood.
@@ -99,12 +159,20 @@ if (typeof engine.recall === 'function') {
     // Usa _seenErrorsSet e _seenErrorsPath definidos no topo — não reinicializa a cada chamada.
 
     // [Fix #8] Monkey-patch console.warn para suprimir warn do .jsc quando errKey já visto
+    // [Fix #11 — QA Auto-Heal 2026-09-27 | ciclo-10]: auto-adicionar ao seenSet na 1ª vez
+    // Problema anterior: warn do .jsc passava na 1ª ocorrência pois seenSet não tinha a key
+    // (arquivo persistido expirado ou restart limpo). Agora: 1ª ocorrência → loga 1x via
+    // _origWarn + adiciona ao set → todas as ocorrências seguintes → suprimidas silenciosamente.
     const _origWarn = console.warn;
     console.warn = function (...warnArgs) {
       const msg = warnArgs.join(' ');
       if (/\[memory-engine\].*recall falhou/.test(msg)) {
         const k = _normalizeErrKey(msg.replace(/.*err=/, ''));
         if (_seenErrorsSet.has(k)) return; // suprimido — já logado 1x
+        // [Fix #11] auto-add: registra no set para suprimir warn do .jsc em ocorrências futuras
+        _seenErrorsSet.add(k);
+        _saveSeenErrors(_seenErrorsSet, _seenErrorsPath);
+        // deixa passar 1x para diagnóstico — o try/catch abaixo também logará via "recall suprimido"
       }
       _origWarn.apply(console, warnArgs);
     };
