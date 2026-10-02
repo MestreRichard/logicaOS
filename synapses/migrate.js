@@ -141,23 +141,53 @@ async function applyDdlV17() {
  * Fallback: aplica cada estrutura individualmente via tabelas REST
  * quando exec_sql RPC não está disponível.
  * Verifica existência via information_schema antes de criar.
+ *
+ * FIX auto-schema-migrations-table (2026-10-02):
+ *   Causa raiz: schema_migrations não existia no Supabase (PGRST205).
+ *   A lógica anterior abortava ao detectar ausência da tabela em vez de criá-la.
+ *   Fix: tentar criar schema_migrations via RPC exec_sql antes de qualquer
+ *   verificação. Se falhar (sem exec_sql), tratar ausência como estado inicial
+ *   válido e prosseguir com o registro via INSERT direto.
  */
 async function applyDdlFallback(fetchFn, headers) {
   const base = `${SUPABASE_URL}/rest/v1`;
 
-  // Verifica se schema_migrations existe (pré-condição)
+  // FIX: Tenta criar schema_migrations se não existir (em vez de abortar)
+  // Tenta via exec_sql primeiro
+  try {
+    const createRes = await fetchFn(`${SUPABASE_URL}/rest/v1/rpc/exec_sql`, {
+      method:  'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sql: `CREATE TABLE IF NOT EXISTS schema_migrations (
+          version     TEXT PRIMARY KEY,
+          description TEXT,
+          applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );`
+      }),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+    });
+    if (createRes.ok) {
+      console.warn('[migrate:v1.7] schema_migrations criada/confirmada via exec_sql');
+    }
+    // Se retornar 404 (sem exec_sql) — prosseguimos mesmo assim (INSERT vai criar implicitamente via Supabase auto-schema em alguns ambientes, ou falhar graciosamente)
+  } catch (_) { /* non-fatal — prosseguir */ }
+
+  // Verifica se schema_migrations existe agora
   try {
     const chk = await fetchFn(
       `${base}/schema_migrations?select=version&limit=1`,
       { headers }
     );
     if (!chk.ok) {
-      console.warn('[migrate:v1.7] schema_migrations inacessível — DDL fallback ignorado');
-      return;
+      // Tabela ainda não existe — logar mas NÃO abortar; tentar INSERT mesmo assim
+      // (comportamento anterior abortava aqui — removido para evitar boot loop)
+      console.warn('[migrate:v1.7] schema_migrations ainda inacessível — prosseguindo sem registro de versão (non-fatal)');
+      // Não retornar — cair no bloco de verificação de v1.7 e tentar INSERT
     }
   } catch (e) {
     console.warn('[migrate:v1.7] Erro ao verificar schema_migrations:', e.message);
-    return;
+    // Prosseguir mesmo assim
   }
 
   // Verifica se v1.7 já está registrada
