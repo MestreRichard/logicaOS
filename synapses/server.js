@@ -10,6 +10,11 @@ require('bytenode');
 const _origStderrWrite = process.stderr.write.bind(process.stderr);
 const _FLOOD_PATTERNS = [
   '[server] NOTION_TOKEN não definido',
+  // QA Auto-Heal 2026-09-29 — Fix #14: suprimir flood de recall falhou do .jsc via stderr.write
+  // Problema: memory-engine.jsc emite "[memory-engine] recall falhou" via process.stderr.write
+  // direto, bypassando o console.warn wrapper. 36 ocorrências/4h durante outages Supabase.
+  // Fix: adicionar padrão aqui (nível mais baixo) — _DEDUP_LIMIT=1 mantém 1 log por tipo para diagnóstico.
+  '[memory-engine] recall falhou',
 ];
 process.stderr.write = function (chunk, encoding, callback) {
   if (typeof chunk === 'string') {
@@ -64,7 +69,13 @@ console.warn  = (...args) => _dedupLog(_originalWarn,  args);
 // Guard: AUTO_MIGRATE=false desabilita (útil em ambientes onde migration é manual).
 // Detectado por: QA Auto-Heal 2026-09-27 | agent_events auto-002
 if (process.env.AUTO_MIGRATE !== 'false') {
+  // QA Auto-Heal Fix #15 — 2026-10-05: single-execution guard por processo
+  // Root cause: _runMigrate era chamada múltiplas vezes (9.903x) por combinação
+  // de setImmediate no boot + event 'supabase:circuit:closed' em cada reconexão.
+  // Fix: global._autoMigrateRan garante que migrate.js rode no máximo 1x por processo.
   function _runMigrate(via) {
+    if (global._autoMigrateRan) return; // guard: single-execution por processo lifetime
+    global._autoMigrateRan = true;
     try {
       require('./migrate');
       _originalWarn('[startup] auto-migrate executado (' + via + ')');

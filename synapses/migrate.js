@@ -149,7 +149,17 @@ async function applyDdlV17() {
  *   verificação. Se falhar (sem exec_sql), tratar ausência como estado inicial
  *   válido e prosseguir com o registro via INSERT direto.
  */
+// ── QA Auto-Heal Fix #14 (2026-10-02) → Fix #15 (2026-10-05): run-once guard ──
+// Fix #14 usava variável de módulo (let _ddlFallbackAttempted) que era ineficaz
+// porque require('./migrate') pode ser re-avaliado em alguns cenários Node.js.
+// Fix #15: migrado para global._ddlMigrateV17Attempted — persiste pelo lifetime
+// do processo independente de como o módulo é carregado.
+// Resultado esperado: 0 PGRST205 repetidos após primeiro boot.
+
 async function applyDdlFallback(fetchFn, headers) {
+  if (global._ddlMigrateV17Attempted) return; // guard: único por processo lifetime
+  global._ddlMigrateV17Attempted = true;
+
   const base = `${SUPABASE_URL}/rest/v1`;
 
   // FIX: Tenta criar schema_migrations se não existir (em vez de abortar)
